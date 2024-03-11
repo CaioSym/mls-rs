@@ -1,14 +1,17 @@
-from mls_rs_uniffi import CipherSuite, generate_signature_keypair, Client, GroupStateStorage, ClientConfig
+from dataclasses import dataclass, field
 
+from mls_rs_uniffi import CipherSuite, generate_signature_keypair, Client, \
+    GroupStateStorage, ClientConfig, ProtocolVersion
+
+@dataclass
 class EpochData:
-    def __init__(self, id: "int", data: "bytes"):
-        self.id = id
-        self.data = data
+    id: int
+    data: bytes
 
+@dataclass
 class GroupStateData:
-    def __init__(self, state: "bytes"):
-        self.state = state
-        self.epoch_data = []
+    state: bytes
+    epoch_data: list[EpochData] = field(default_factory=list)
 
 class PythonGroupStateStorage(GroupStateStorage):
     def __init__(self):
@@ -20,7 +23,7 @@ class PythonGroupStateStorage(GroupStateStorage):
         if group == None:
             return None 
 
-        group.state
+        return group.state
 
     def epoch(self, group_id: "bytes",epoch_id: "int"):
         group = self.groups[group_id.hex()]
@@ -71,8 +74,14 @@ key = generate_signature_keypair(CipherSuite.CURVE25519_AES128)
 bob = Client(b'bob', key, client_config)
 
 alice = alice.create_group(None)
-kp = bob.generate_key_package_message()
-commit = alice.add_members([kp])
+message = bob.generate_key_package_message()
+key_package = message.into_key_package()
+assert key_package.version() == ProtocolVersion.MLS10
+assert key_package.cipher_suite() == CipherSuite.CURVE25519_AES128
+assert len(key_package.hpke_init_key().key) == 32
+assert len(key_package.signature()) == 64
+
+commit = alice.add_members([message])
 alice.process_incoming_message(commit.commit_message())
 bob = bob.join_group(commit.welcome_messages()[0]).group
 

@@ -129,14 +129,67 @@ pub struct JoinInfo {
     pub group_info_extensions: Arc<ExtensionList>,
 }
 
+#[derive(Copy, Clone, Debug, uniffi::Enum)]
+pub enum ProtocolVersion {
+    /// MLS version 1.0.
+    Mls10,
+}
+
+impl TryFrom<mls_rs::ProtocolVersion> for ProtocolVersion {
+    type Error = Error;
+
+    fn try_from(version: mls_rs::ProtocolVersion) -> Result<Self, Self::Error> {
+        match version {
+            mls_rs::ProtocolVersion::MLS_10 => Ok(ProtocolVersion::Mls10),
+            _ => Err(MlsError::UnsupportedProtocolVersion(version))?,
+        }
+    }
+}
+
+/// Wrapper around a [`mls_rs::crypto::HpkePublicKey`].
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct HpkePublicKey {
+    pub key: Vec<u8>,
+}
+
+impl From<mls_rs::crypto::HpkePublicKey> for HpkePublicKey {
+    fn from(key: mls_rs::crypto::HpkePublicKey) -> Self {
+        Self { key: key.into() }
+    }
+}
+
+/// Wrapper around a [`mls_rs::KeyPackage`].
 #[derive(Clone, Debug, uniffi::Object)]
 pub struct KeyPackage {
-    _inner: mls_rs::KeyPackage,
+    inner: mls_rs::KeyPackage,
 }
 
 impl From<mls_rs::KeyPackage> for KeyPackage {
     fn from(inner: mls_rs::KeyPackage) -> Self {
-        Self { _inner: inner }
+        Self { inner }
+    }
+}
+
+#[uniffi::export]
+impl KeyPackage {
+    pub fn version(&self) -> Result<ProtocolVersion, Error> {
+        self.inner.version.try_into()
+    }
+
+    pub fn cipher_suite(&self) -> Result<CipherSuite, Error> {
+        self.inner.cipher_suite.try_into()
+    }
+
+    pub fn hpke_init_key(&self) -> HpkePublicKey {
+        self.inner.hpke_init_key.clone().into()
+    }
+
+    pub fn extensions(&self) -> ExtensionList {
+        self.inner.extensions.clone().into()
+    }
+
+    pub fn signature(&self) -> Vec<u8> {
+        self.inner.signature.clone()
     }
 }
 
@@ -149,6 +202,16 @@ pub struct Message {
 impl From<mls_rs::MlsMessage> for Message {
     fn from(inner: mls_rs::MlsMessage) -> Self {
         Self { inner }
+    }
+}
+
+#[uniffi::export]
+impl Message {
+    pub fn into_key_package(self: Arc<Self>) -> Option<Arc<KeyPackage>> {
+        let message = arc_unwrap_or_clone(self).inner;
+        message
+            .into_key_package()
+            .map(|key_package| Arc::new(key_package.into()))
     }
 }
 
@@ -175,8 +238,10 @@ pub enum ReceivedMessage {
     /// A new commit was processed creating a new group state.
     Commit { committer: Arc<SigningIdentity> },
 
+    // TODO(mgeisler): rename to `Proposal` when
+    // https://github.com/awslabs/mls-rs/issues/98 is fixed.
     /// A proposal was received.
-    Proposal {
+    ReceivedProposal {
         sender: Arc<SigningIdentity>,
         proposal: Arc<Proposal>,
     },
@@ -186,8 +251,10 @@ pub enum ReceivedMessage {
     /// Validated welcome message.
     Welcome,
 
+    // TODO(mgeisler): rename to `KeyPackage` when
+    // https://github.com/awslabs/mls-rs/issues/98 is fixed.
     /// Validated key package.
-    KeyPackage { key_package: Arc<KeyPackage> },
+    ValidatedKeyPackage { key_package: Arc<KeyPackage> },
 }
 
 /// Supported cipher suites.
@@ -204,6 +271,17 @@ impl From<CipherSuite> for mls_rs::CipherSuite {
     fn from(cipher_suite: CipherSuite) -> mls_rs::CipherSuite {
         match cipher_suite {
             CipherSuite::Curve25519Aes128 => mls_rs::CipherSuite::CURVE25519_AES128,
+        }
+    }
+}
+
+impl TryFrom<mls_rs::CipherSuite> for CipherSuite {
+    type Error = Error;
+
+    fn try_from(cipher_suite: mls_rs::CipherSuite) -> Result<Self, Self::Error> {
+        match cipher_suite {
+            mls_rs::CipherSuite::CURVE25519_AES128 => Ok(CipherSuite::Curve25519Aes128),
+            _ => Err(MlsError::UnsupportedCipherSuite(cipher_suite))?,
         }
     }
 }
@@ -581,7 +659,7 @@ impl Group {
                     _ => todo!("External and NewMember proposal senders are not supported"),
                 };
                 let proposal = Arc::new(proposal_message.proposal.into());
-                Ok(ReceivedMessage::Proposal { sender, proposal })
+                Ok(ReceivedMessage::ReceivedProposal { sender, proposal })
             }
             // TODO: group::ReceivedMessage::GroupInfo does not have any
             // public methods (unless the "ffi" Cargo feature is set).
@@ -590,8 +668,131 @@ impl Group {
             group::ReceivedMessage::Welcome => Ok(ReceivedMessage::Welcome),
             group::ReceivedMessage::KeyPackage(key_package) => {
                 let key_package = Arc::new(key_package.into());
-                Ok(ReceivedMessage::KeyPackage { key_package })
+                Ok(ReceivedMessage::ValidatedKeyPackage { key_package })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::group_state::{EpochRecord, GroupState, GroupStateStorage};
+    use crate::config::FFICallbackError;
+    use std::collections::HashMap;
+
+    #[test]
+    #[cfg(not(mls_build_async))]
+    fn test_simple_scenario() -> Result<(), Error> {
+        #[derive(Debug, Default)]
+        struct GroupStateData {
+            state: Vec<u8>,
+            epoch_data: Vec<EpochRecord>,
+        }
+
+        #[derive(Debug)]
+        struct CustomGroupStateStorage {
+            groups: Mutex<HashMap<Vec<u8>, GroupStateData>>,
+        }
+
+        impl CustomGroupStateStorage {
+            fn new() -> Self {
+                Self {
+                    groups: Mutex::new(HashMap::new()),
+                }
+            }
+
+            fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, GroupStateData>> {
+                self.groups.lock().unwrap()
+            }
+        }
+
+        impl GroupStateStorage for CustomGroupStateStorage {
+            fn state(&self, group_id: Vec<u8>) -> Result<Option<Vec<u8>>, FFICallbackError> {
+                let groups = self.lock();
+                Ok(groups.get(&group_id).map(|group| group.state.clone()))
+            }
+
+            fn epoch(
+                &self,
+                group_id: Vec<u8>,
+                epoch_id: u64,
+            ) -> Result<Option<Vec<u8>>, FFICallbackError> {
+                let groups = self.lock();
+                match groups.get(&group_id) {
+                    Some(group) => {
+                        let epoch_record =
+                            group.epoch_data.iter().find(|record| record.id == epoch_id);
+                        let data = epoch_record.map(|record| record.data.clone());
+                        Ok(data)
+                    }
+                    None => Ok(None),
+                }
+            }
+
+            fn write(
+                &self,
+                state: GroupState,
+                epoch_inserts: Vec<EpochRecord>,
+                epoch_updates: Vec<EpochRecord>,
+            ) -> Result<(), FFICallbackError> {
+                let mut groups = self.lock();
+
+                let group = groups.entry(state.id).or_default();
+                group.state = state.data;
+                for insert in epoch_inserts {
+                    group.epoch_data.push(insert);
+                }
+
+                for update in epoch_updates {
+                    for epoch in group.epoch_data.iter_mut() {
+                        if epoch.id == update.id {
+                            epoch.data = update.data;
+                            break;
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+
+            fn max_epoch_id(&self, group_id: Vec<u8>) -> Result<Option<u64>, FFICallbackError> {
+                let groups = self.lock();
+                Ok(groups
+                    .get(&group_id)
+                    .and_then(|GroupStateData { epoch_data, .. }| epoch_data.last())
+                    .map(|last| last.id))
+            }
+        }
+
+        let alice_config = ClientConfig {
+            group_state_storage: Arc::new(CustomGroupStateStorage::new()),
+        };
+        let alice_keypair = generate_signature_keypair(CipherSuite::Curve25519Aes128)?;
+        let alice = Client::new(b"alice".to_vec(), alice_keypair, alice_config);
+
+        let bob_config = ClientConfig {
+            group_state_storage: Arc::new(CustomGroupStateStorage::new()),
+        };
+        let bob_keypair = generate_signature_keypair(CipherSuite::Curve25519Aes128)?;
+        let bob = Client::new(b"bob".to_vec(), bob_keypair, bob_config);
+
+        let alice_group = alice.create_group(None)?;
+        let bob_key_package = bob.generate_key_package_message()?;
+        let commit = alice_group.add_members(vec![Arc::new(bob_key_package)])?;
+        alice_group.process_incoming_message(Arc::new(commit.commit_message()))?;
+
+        let bob_group = bob.join_group(&commit.welcome_messages()[0])?.group;
+        let message = alice_group.encrypt_application_message(b"hello, bob")?;
+        let received_message = bob_group.process_incoming_message(Arc::new(message))?;
+
+        alice_group.write_to_storage()?;
+
+        let ReceivedMessage::ApplicationMessage { sender: _, data } = received_message else {
+            panic!("Wrong message type: {received_message:?}");
+        };
+        assert_eq!(data, b"hello, bob");
+
+        Ok(())
     }
 }

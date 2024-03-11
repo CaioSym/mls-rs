@@ -7,9 +7,9 @@ use mls_rs::{
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_openssl::OpensslCryptoProvider;
 
-use self::group_state::GroupStateStorageWrapper;
+use self::group_state::{GroupStateStorage, GroupStateStorageWrapper};
 
-mod group_state;
+pub mod group_state;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -39,5 +39,5 @@ pub type UniFFIConfig = client_builder::WithIdentityProvider<
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ClientConfig {
-    pub group_state_storage: Arc<dyn group_state::GroupStateStorage>,
+    pub group_state_storage: Arc<dyn GroupStateStorage>,
 }
